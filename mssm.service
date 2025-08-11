@@ -1,0 +1,14 @@
+[Unit]
+Description=Multi-Server SSH Monitor
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/mssm
+ExecStart=/usr/bin/python3 /opt/mssm/Multi-server-ssh-monitor_live3.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
