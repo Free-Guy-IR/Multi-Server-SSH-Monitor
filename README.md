@@ -1,5 +1,7 @@
 
 # 📊 Multi-Server SSH Monitor (Flask + Paramiko)
+<img width="1360" height="768" alt="Screenshot (99)" src="https://github.com/user-attachments/assets/4970a641-f7fc-4493-9998-da847b8a19db" />
+
 
 داشبورد تحت‌وب برای مانیتورینگ و مدیریت چند سرور لینوکسی از طریق SSH با رابط فارسی و حالت تاریک.
 
