@@ -1,0 +1,14 @@
+{
+  "poll_interval": 2,
+  "admin_token": null,
+  "servers": [
+    {
+      "name": "4414",
+      "host": "8.8.8.8",
+      "port": 22,
+      "username": "root",
+      "password": null,
+      "key_path": null
+    }
+  ]
+}
