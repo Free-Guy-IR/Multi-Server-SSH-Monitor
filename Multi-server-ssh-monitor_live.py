@@ -875,9 +875,6 @@ body{
 
 <div class="container">
   <div id="grid" class="grid"></div>
-  <div id="u-empty" style="display:none;margin-top:20px;text-align:center;color:#cfd6e4">سروری یافت نشد.</div>
-  <div id="u-empty" style="display:none;margin-top:20px;text-align:center;color:#cfd6e4">سروری یافت نشد.</div>
-  <div id="empty-state" style="display:none;margin-top:20px;text-align:center;color:#cfd6e4">هیچ سروری در لیست نیست. از «مدیریت سرورها» استفاده کنید.</div>
   <div class="footer-note">Refresh interval adapts to servers.json • همه‌چیز فقط روی همین سیستم شما اجرا می‌شود</div>
 </div>
 
@@ -1000,18 +997,11 @@ document.getElementById('range-chips').addEventListener('click', (e)=>{
 });
 
 async function fetchSummary(){
-  try{
-    const r = await fetch('/api/summary');
-    if(!r.ok) throw new Error('HTTP '+r.status);
-    const j = await r.json();
-    state.admin = !!j.admin_token;
-    state.servers = Array.isArray(j.servers) ? j.servers : [];
-    renderCards(state.servers, j.interval||3);
-  }catch(e){
-    console.error('summary error', e);
-    const grid=document.getElementById('grid'); if(grid) grid.innerHTML='';
-    const es=document.getElementById('empty-state'); if(es) es.style.display='block';
-  }
+  const r = await fetch('/api/summary');
+  const j = await r.json();
+  state.admin = !!j.admin_token;
+  state.servers = j.servers;
+  renderCards(j.servers, j.interval);
 }
 
 function makeGauge(ctx, initial){
@@ -1377,8 +1367,6 @@ def main():
     here = os.path.dirname(os.path.abspath(__file__))
     cfg = os.path.join(here, "servers.json")
     MON = Monitor(cfg)
-    print(f"[BOOT] Using servers.json: {cfg}")
-    print(f"[BOOT] Servers loaded: {len(MON.states)}")
     MON.start()
     HOST = os.getenv("HOST", "0.0.0.0"); PORT = int(os.getenv("PORT", "8000"))
     app.run(host=HOST, port=PORT, debug=False)
@@ -1613,6 +1601,224 @@ def api_uptime_summary():
         "tcp_port": port
     })
 
+@app.get("/api/uptime_settings")
+def api_uptime_settings_get():
+    return jsonify(_load_ports())
+
+@app.post("/api/uptime_settings")
+def api_uptime_settings_set():
+    data = request.get_json(silent=True) or {}
+    target = data.get("target"); port = data.get("port")
+    if not target or not port:
+        return jsonify({"error":"target and port required"}), 400
+    ports = _load_ports(); ports[target] = int(port); _save_ports(ports)
+    return jsonify({"status":"ok","port":int(port)})
+
+# ======================= [APPEND v7] Robust TCP probe (IPv4/IPv6 + timeout + mode) =======================
+import ssl as _ssl
+
+# Extend settings to support: {"port": int, "timeout_ms": int, "mode": "connect|http|tls"}
+def _load_ports_v2():
+    try:
+        with open(UP_PORTS_PATH, "r", encoding="utf-8") as f:
+            d = _json.load(f)
+        # backward-compat: values may be integers (port)
+        out = {}
+        for k, v in d.items():
+            if isinstance(v, int):
+                out[k] = {"port": v, "timeout_ms": 2000, "mode": "connect"}
+            elif isinstance(v, dict):
+                out[k] = {
+                    "port": int(v.get("port", 80)),
+                    "timeout_ms": int(v.get("timeout_ms", 2000)),
+                    "mode": str(v.get("mode", "connect")).lower()
+                }
+            else:
+                out[k] = {"port": 80, "timeout_ms": 2000, "mode": "connect"}
+        return out
+    except Exception:
+        return {}
+
+def _save_ports_v2(d):
+    # keep as dict with port/timeout/mode
+    try:
+        with open(UP_PORTS_PATH, "w", encoding="utf-8") as f:
+            _json.dump(d, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print("[UPCFG] save error:", e)
+
+def _coerce_port_cfg(ports_cfg, st):
+    item = ports_cfg.get(st.cfg.name) or ports_cfg.get(st.cfg.host) or {"port":80,"timeout_ms":2000,"mode":"connect"}
+    # sanitize
+    port = int(item.get("port", 80))
+    timeout_ms = int(item.get("timeout_ms", 2000))
+    mode = str(item.get("mode", "connect")).lower()
+    if timeout_ms < 500: timeout_ms = 500
+    if mode not in ("connect","http","tls"): mode = "connect"
+    return port, timeout_ms, mode
+
+def _connect_any(host, port, timeout_s):
+    last_err = None
+    infos = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+    for family, socktype, proto, canonname, sockaddr in infos:
+        s = None
+        try:
+            s = socket.socket(family, socktype, proto)
+            s.settimeout(timeout_s)
+            t0 = time.time()
+            s.connect(sockaddr)
+            return s, (time.time()-t0)*1000.0  # socket + connect ms
+        except Exception as e:
+            last_err = e
+            try:
+                if s: s.close()
+            except Exception:
+                pass
+        # try next
+    raise last_err if last_err else OSError("connect failed")
+
+# Replace probe to accept (port, timeout, mode)
+def _probe_ping_tcp_v2(self, st, tcp_port: int, timeout_ms: int, mode: str):
+    # Ensure history is ready
+    if not hasattr(st, "probe_hist"):
+        from collections import deque as __dq
+        st.probe_hist = __dq(maxlen=6*60*24)
+    if not getattr(st, "_status_loaded", False):
+        try: self._load_status(st)
+        except Exception: pass
+
+    ok_ping = False
+    ms = None
+    ok_tcp = False
+
+    # ICMP ping (OS-aware)
+    try:
+        sys = platform.system().lower()
+        if "windows" in sys:
+            cmd = ["ping", "-n", "1", "-w", str(max(1000, timeout_ms)), st.cfg.host]  # ms
+        else:
+            # linux uses seconds for -w, but allow ~ceil
+            wsec = max(1, int(round(timeout_ms/1000.0)))
+            cmd = ["ping", "-n", "-c", "1", "-w", str(wsec), st.cfg.host]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        ok_ping = (r.returncode == 0)
+        if ok_ping:
+            m = re.search(r"time[=<]([\d\.]+)\s*ms", (r.stdout or "") + " " + (r.stderr or ""))
+            if m:
+                try: ms = float(m.group(1))
+                except Exception: ms = None
+    except Exception:
+        pass
+
+    # TCP probe
+    tcp_ms = None
+    sock = None
+    try:
+        sock, conn_ms = _connect_any(st.cfg.host, int(tcp_port), timeout_ms/1000.0)
+        ok_tcp = True
+        tcp_ms = conn_ms
+        if mode == "http":
+            try:
+                # Minimal HEAD to check app readiness
+                req = "HEAD / HTTP/1.1\\r\\nHost: {}\\r\\nConnection: close\\r\\n\\r\\n".format(st.cfg.host)
+                sock.sendall(req.encode("ascii", "ignore"))
+                sock.settimeout(max(0.5, timeout_ms/1000.0))
+                _ = sock.recv(1)  # any byte back is success
+            except Exception as e:
+                ok_tcp = False
+        elif mode == "tls":
+            try:
+                ctx = _ssl.create_default_context()
+                # don't enforce cert validity for liveness
+                ctx.check_hostname = False
+                ctx.verify_mode = _ssl.CERT_NONE
+                t1 = time.time()
+                with ctx.wrap_socket(sock, server_hostname=st.cfg.host) as tls:
+                    pass  # handshake happens on wrap
+                tcp_ms = (time.time()-t1)*1000.0 + (tcp_ms or 0.0)
+            except Exception as e:
+                ok_tcp = False
+    except Exception as e:
+        ok_tcp = False
+    finally:
+        try:
+            if sock: sock.close()
+        except Exception:
+            pass
+    # fallback latency disabled: keep ms None when ICMP is blocked
+    st.last_ping_ms = ms
+    st.probe_hist.append({"t": time.time(), "ok": ok_ping, "ms": ms, "tcp": ok_tcp})
+    self._append_status(st, ok_ping, ms, ok_tcp)
+
+# Patch loop to reload settings each probe tick
+def _loop_with_probe_v7(self):
+    self._last_probe_tick = getattr(self, "_last_probe_tick", 0)
+    while not self._stop.is_set():
+        t0 = time.time()
+        for st in list(self.states):
+            try:
+                if not st.connected or not st.ssh:
+                    self._connect(st)
+                self._poll_server(st)
+            except Exception as e:
+                st.last_err = str(e); st.connected = False
+                try:
+                    if st.ssh: st.ssh.close()
+                except Exception: pass
+                st.ssh = None
+
+            try:
+                if time.time() - self._last_probe_tick >= 10:
+                    cfg = _load_ports_v2()
+                    port, to_ms, mode = _coerce_port_cfg(cfg, st)
+                    _probe_ping_tcp_v2(self, st, port, to_ms, mode)
+            except Exception:
+                pass
+
+        if time.time() - self._last_probe_tick >= 10:
+            self._last_probe_tick = time.time()
+
+        dt = time.time() - t0
+        time.sleep(max(0.0, self.interval - dt))
+
+Monitor._loop = _loop_with_probe_v7
+
+# Update APIs to expose mode/timeout and accept updates
+@app.get("/api/uptime_summary")
+def api_uptime_summary_v7():
+    assert MON is not None
+    name = request.args.get("name","")
+    st = next((x for x in MON.states if x.cfg.name == name or x.cfg.host == name), None)
+    if not st: abort(404, "server not found")
+    def pct(seconds, key):
+        cutoff = time.time() - seconds
+        pts = [p for p in list(getattr(st, "probe_hist", [])) if p["t"] >= cutoff]
+        if not pts: return None
+        ok = sum(1 for p in pts if bool(p.get(key)))
+        return (ok/len(pts))*100.0
+    def ping_avg(seconds):
+        cutoff = time.time() - seconds
+        vals = [p.get("ms") for p in list(getattr(st, "probe_hist", [])) if p["t"] >= cutoff and p.get("ms") is not None]
+        if not vals: return None
+        return sum(vals)/len(vals)
+    cfg = _load_ports_v2()
+    port, to_ms, mode = _coerce_port_cfg(cfg, st)
+    return jsonify({
+        "uptime_ping_1h": pct(3600, "ok"),
+        "uptime_ping_24h": pct(86400, "ok"),
+        "uptime_tcp_1h": pct(3600, "tcp"),
+        "uptime_tcp_24h": pct(86400, "tcp"),
+        "ping_avg_24h": ping_avg(86400),
+        "last_ms": getattr(st, "last_ping_ms", None),
+        "tcp_port": int(port),
+        "tcp_timeout_ms": int(to_ms),
+        "tcp_mode": mode
+    })
+
+@app.get("/api/uptime_settings")
+def api_uptime_settings_get_v7():
+    return jsonify(_load_ports_v2())
+
 @app.post("/api/uptime_settings")
 def api_uptime_settings_set_v7():
     data = request.get_json(silent=True) or {}
@@ -1737,27 +1943,10 @@ function makePing(ctx){
 }
 
 async function fetchSummary(){
-  try{
-    const sumR = await fetch('/api/summary');
-    const sumJ = await sumR.json();
-    state.servers = Array.isArray(sumJ.servers)? sumJ.servers:[];
-  }catch(e){
-    console.error('uptime summary error', e);
-    state.servers = [];
-  }
-  try{
-    const portsR = await fetch('/api/uptime_settings');
-    if (portsR.ok){
-      state.ports = await portsR.json();
-    } else {
-      state.ports = {};
-    }
-  }catch(e){
-    console.warn('uptime settings error (continuing with defaults)', e);
-    state.ports = {};
-  }
-  renderCards();
-  refreshAll();
+  const [sumR, portsR] = await Promise.all([fetch('/api/summary'), fetch('/api/uptime_settings')]);
+  const sumJ = await sumR.json(); state.servers = sumJ.servers;
+  state.ports = await portsR.json();
+  renderCards(); refreshAll();
 }
 
 function cardHtml(s){
@@ -1785,14 +1974,7 @@ function cardHtml(s){
 }
 
 function renderCards(){
-  const grid = document.getElementById('grid');
-  if (!state.servers || !state.servers.length){
-    if (grid) grid.innerHTML='';
-    const es=document.getElementById('u-empty'); if(es) es.style.display='block';
-    return;
-  } else {
-    const es=document.getElementById('u-empty'); if(es) es.style.display='none';
-  } grid.innerHTML='';
+  const grid = document.getElementById('grid'); grid.innerHTML='';
   for(const s of state.servers){
     const card = document.createElement('div'); card.className='card'; card.id='card-'+s.name;
     card.innerHTML = cardHtml(s);
