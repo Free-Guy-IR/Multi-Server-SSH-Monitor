@@ -875,6 +875,9 @@ body{
 
 <div class="container">
   <div id="grid" class="grid"></div>
+  <div id="u-empty" style="display:none;margin-top:20px;text-align:center;color:#cfd6e4">سروری یافت نشد.</div>
+  <div id="u-empty" style="display:none;margin-top:20px;text-align:center;color:#cfd6e4">سروری یافت نشد.</div>
+  <div id="empty-state" style="display:none;margin-top:20px;text-align:center;color:#cfd6e4">هیچ سروری در لیست نیست. از «مدیریت سرورها» استفاده کنید.</div>
   <div class="footer-note">Refresh interval adapts to servers.json • همه‌چیز فقط روی همین سیستم شما اجرا می‌شود</div>
 </div>
 
@@ -997,11 +1000,18 @@ document.getElementById('range-chips').addEventListener('click', (e)=>{
 });
 
 async function fetchSummary(){
-  const r = await fetch('/api/summary');
-  const j = await r.json();
-  state.admin = !!j.admin_token;
-  state.servers = j.servers;
-  renderCards(j.servers, j.interval);
+  try{
+    const r = await fetch('/api/summary');
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    const j = await r.json();
+    state.admin = !!j.admin_token;
+    state.servers = Array.isArray(j.servers) ? j.servers : [];
+    renderCards(state.servers, j.interval||3);
+  }catch(e){
+    console.error('summary error', e);
+    const grid=document.getElementById('grid'); if(grid) grid.innerHTML='';
+    const es=document.getElementById('empty-state'); if(es) es.style.display='block';
+  }
 }
 
 function makeGauge(ctx, initial){
@@ -1367,8 +1377,555 @@ def main():
     here = os.path.dirname(os.path.abspath(__file__))
     cfg = os.path.join(here, "servers.json")
     MON = Monitor(cfg)
+    print(f"[BOOT] Using servers.json: {cfg}")
+    print(f"[BOOT] Servers loaded: {len(MON.states)}")
     MON.start()
-    app.run(host="0.0.0.0", port=8000, debug=False)
+    HOST = os.getenv("HOST", "0.0.0.0"); PORT = int(os.getenv("PORT", "8000"))
+    app.run(host=HOST, port=PORT, debug=False)
+
+
+# ======================= [APPEND PRO UI] Incident Monitor (Ping + TCP + Pro Buttons) =======================
+import subprocess, re, socket, json as _json, platform, time as _time
+from collections import deque as _deque
+
+UP_PORTS_PATH = os.path.join(PERSIST_DIR, "uptime_ports.json")
+
+def _load_ports():
+    try:
+        with open(UP_PORTS_PATH, "r", encoding="utf-8") as f:
+            return _json.load(f)
+    except Exception:
+        return {}
+
+def _save_ports(d):
+    try:
+        with open(UP_PORTS_PATH, "w", encoding="utf-8") as f:
+            _json.dump(d, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print("[UPCFG] save error:", e)
+
+def _status_path(self, st):
+    safe = "".join(c for c in st.cfg.name if c.isalnum() or c in ("-", "_"))
+    return os.path.join(PERSIST_DIR, f"status_{safe}.ndjson")
+
+def _append_status(self, st, ok_ping, ms, ok_tcp):
+    try:
+        with open(self._status_path(st), "a", encoding="utf-8") as f:
+            f.write(_json.dumps({"t": time.time(), "ok": bool(ok_ping), "ms": ms, "tcp": bool(ok_tcp)}) + "\\n")
+    except Exception as e:
+        print(f"[STATUS] append error for {st.cfg.name}: {e}")
+
+def _ensure_probe_attrs(st):
+    if not hasattr(st, "probe_hist"):
+        st.probe_hist = _deque(maxlen=6*60*24)  # 24h @ 10s
+    if not hasattr(st, "last_ping_ms"):
+        st.last_ping_ms = None
+    if not hasattr(st, "_status_loaded"):
+        st._status_loaded = False
+
+
+
+def _load_status(self, st, seconds: int = 86400):
+    """Load uptime probe history, ensuring dynamic attributes exist first."""
+    try:
+        # Ensure dynamic attrs
+        if not hasattr(st, "probe_hist"):
+            from collections import deque as __dq
+            st.probe_hist = __dq(maxlen=6*60*24)  # ~24h at 10s resolution
+        if not hasattr(st, "last_ping_ms"):
+            st.last_ping_ms = None
+        if not hasattr(st, "_status_loaded"):
+            st._status_loaded = False
+
+        pth = self._status_path(st)
+        if not os.path.exists(pth):
+            st._status_loaded = True
+            return
+
+        cutoff = time.time() - seconds
+        with open(pth, "r", encoding="utf-8") as f:
+            for ln in f:
+                try:
+                    d = _json.loads(ln)
+                    if d.get("t", 0) >= cutoff:
+                        # Backward-compatible fields
+                        if "ok" not in d: d["ok"] = False
+                        if "tcp" not in d: d["tcp"] = False
+                        st.probe_hist.append(d)
+                        if d.get("ms") is not None:
+                            st.last_ping_ms = d["ms"]
+                except Exception:
+                    continue
+        st._status_loaded = True
+        print(f"[STATUS] Loaded {len(st.probe_hist)} probes for {st.cfg.name}")
+    except Exception as e:
+        print(f"[STATUS] load error for {st.cfg.name}: {e}")
+        st._status_loaded = True
+
+
+def _probe_ping_tcp(self, st, tcp_port: int):
+    """Single probe: ICMP ping + TCP connect to port (latency fallback)."""
+    # Ensure history is ready
+    if not hasattr(st, "probe_hist"):
+        from collections import deque as __dq
+        st.probe_hist = __dq(maxlen=6*60*24)
+    if not getattr(st, "_status_loaded", False):
+        try: self._load_status(st)
+        except Exception: pass
+
+    ok_ping = False
+    ms = None
+    ok_tcp = False
+
+    # ICMP ping (OS-aware)
+    try:
+        sys = platform.system().lower()
+        if "windows" in sys:
+            cmd = ["ping", "-n", "1", "-w", "1000", st.cfg.host]  # 1 try, 1s timeout
+        else:
+            cmd = ["ping", "-n", "-c", "1", "-w", "1", st.cfg.host]  # linux-like
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        ok_ping = (r.returncode == 0)
+        if ok_ping:
+            m = re.search(r"time[=<]([\d\.]+)\s*ms", (r.stdout or "") + " " + (r.stderr or ""))
+            if m:
+                try:
+                    ms = float(m.group(1))
+                except Exception:
+                    ms = None
+    except Exception:
+        pass
+
+    # TCP port probe (+ latency hint if ICMP blocked)
+    t0 = time.time()
+    try:
+        with socket.create_connection((st.cfg.host, int(tcp_port)), timeout=1.0) as s:
+            ok_tcp = True
+    except Exception:
+        ok_tcp = False
+    tcp_ms = (time.time() - t0) * 1000.0
+    if ms is None and ok_tcp:
+        ms = tcp_ms
+
+    st.last_ping_ms = ms
+    st.probe_hist.append({"t": time.time(), "ok": ok_ping, "ms": ms, "tcp": ok_tcp})
+    self._append_status(st, ok_ping, ms, ok_tcp)
+
+Monitor._status_path = _status_path
+Monitor._append_status = _append_status
+Monitor._load_status = _load_status
+Monitor._probe_ping_tcp = _probe_ping_tcp
+
+# Custom loop (adds 10s probes)
+_Original_Loop = Monitor._loop
+def _loop_with_probe(self):
+    self._last_probe_tick = getattr(self, "_last_probe_tick", 0)
+    ports_cfg = _load_ports()
+    while not self._stop.is_set():
+        t0 = time.time()
+        for st in list(self.states):
+            try:
+                if not st.connected or not st.ssh:
+                    self._connect(st)
+                self._poll_server(st)
+            except Exception as e:
+                st.last_err = str(e); st.connected = False
+                try:
+                    if st.ssh: st.ssh.close()
+                except Exception: pass
+                st.ssh = None
+            try:
+                if time.time() - self._last_probe_tick >= 10:
+                    port = int(ports_cfg.get(st.cfg.name) or ports_cfg.get(st.cfg.host) or 80)
+                    self._probe_ping_tcp(st, port)
+            except Exception:
+                pass
+        if time.time() - self._last_probe_tick >= 10:
+            self._last_probe_tick = time.time()
+        dt = time.time() - t0
+        time.sleep(max(0.0, self.interval - dt))
+
+Monitor._loop = _loop_with_probe
+
+# Patch start() to also load uptime status on boot so UI has history instantly
+_Original_Start = Monitor.start
+def _start_with_status(self):
+    try:
+        print(f"[DEBUG] Starting monitor for {len(self.states)} servers, interval={self.interval}s (with uptime preload)")
+        for st in self.states:
+            self._connect(st)
+            self._load_persist(st)
+            try:
+                self._load_status(st, seconds=86400)
+            except Exception:
+                pass
+        self._thread.start()
+    except Exception:
+        # fallback to original behavior
+        _Original_Start(self)
+Monitor.start = _start_with_status
+
+
+# ----------------------------- APIs -----------------------------
+@app.get("/api/uptime")
+def api_uptime():
+    assert MON is not None
+    name = request.args.get("name","")
+    seconds = int(request.args.get("seconds","600"))
+    st = next((x for x in MON.states if x.cfg.name == name or x.cfg.host == name), None)
+    if not st: abort(404, "server not found")
+    _ensure_probe_attrs(st)
+    if not getattr(st, "_status_loaded", False):
+        MON._load_status(st, seconds=max(seconds, 3600))
+    cutoff = time.time() - seconds
+    series = [p for p in list(st.probe_hist) if p["t"] >= cutoff]
+    return jsonify({"name": st.cfg.name, "series": series})
+
+@app.get("/api/uptime_summary")
+def api_uptime_summary():
+    assert MON is not None
+    name = request.args.get("name","")
+    st = next((x for x in MON.states if x.cfg.name == name or x.cfg.host == name), None)
+    if not st: abort(404, "server not found")
+    _ensure_probe_attrs(st)
+    if not getattr(st, "_status_loaded", False):
+        MON._load_status(st)
+    def pct(seconds, key):
+        cutoff = time.time() - seconds
+        pts = [p for p in list(st.probe_hist) if p["t"] >= cutoff]
+        if not pts: return None
+        ok = sum(1 for p in pts if bool(p.get(key)))
+        return (ok/len(pts))*100.0
+    def ping_avg(seconds):
+        cutoff = time.time() - seconds
+        vals = [p.get("ms") for p in list(st.probe_hist) if p["t"] >= cutoff and p.get("ms") is not None]
+        if not vals: return None
+        return sum(vals)/len(vals)
+    ports_cfg = _load_ports()
+    port = int(ports_cfg.get(st.cfg.name) or ports_cfg.get(st.cfg.host) or 80)
+    return jsonify({
+        "uptime_ping_1h": pct(3600, "ok"),
+        "uptime_ping_24h": pct(86400, "ok"),
+        "uptime_tcp_1h": pct(3600, "tcp"),
+        "uptime_tcp_24h": pct(86400, "tcp"),
+        "ping_avg_24h": ping_avg(86400),
+        "last_ms": getattr(st, "last_ping_ms", None),
+        "tcp_port": port
+    })
+
+@app.post("/api/uptime_settings")
+def api_uptime_settings_set_v7():
+    data = request.get_json(silent=True) or {}
+    target = data.get("target")
+    port = data.get("port")
+    timeout_ms = data.get("timeout_ms", 2000)
+    mode = str(data.get("mode", "connect")).lower()
+    if not target or not port:
+        return jsonify({"error":"target and port required"}), 400
+    ports = _load_ports_v2()
+    ports[target] = {"port": int(port), "timeout_ms": int(timeout_ms), "mode": mode if mode in ("connect","http","tls") else "connect"}
+    _save_ports_v2(ports)
+    return jsonify({"status":"ok","port":int(port),"timeout_ms":int(timeout_ms),"mode":ports[target]["mode"]})
+
+# UI: extend settings prompt to accept "port[,timeout_ms][,mode]"
+# We only modify the uptime page template; we keep look & feel consistent.
+def _inject_ui_prompt_upgrade(html):
+    # simplified: no-op (UI already directly patched)
+    return html
+
+# Try to patch UPTIME_HTML if present
+try:
+    UPTIME_HTML = _inject_ui_prompt_upgrade(UPTIME_HTML)
+except Exception as _e:
+    print("[UI] inject prompt upgrade skipped:", _e)
+# ======================= [END v7] =======================
+
+# ----------------------------- Pages -----------------------------
+NAV_WRAPPER_HTML = r"""
+<!doctype html><html lang="fa" dir="rtl"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Multi-Server SSH Monitor — ناوبری</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
+<style>
+:root{--bg:#0f1115;--text:#e5e7eb;--border:#262c3e;--r1:#6366f1;--r2:#a855f7;}
+*{box-sizing:border-box} html,body{height:100%}
+body{margin:0;background:linear-gradient(180deg,#0c0f14,#0f1115 25%,#0f1115);color:var(--text);font-family:Inter,system-ui,Segoe UI,Roboto,Arial,sans-serif}
+.top{position:sticky;top:0;z-index:10;backdrop-filter:saturate(160%) blur(8px);background:rgba(16,18,26,.55);border-bottom:1px solid rgba(255,255,255,.06);}
+.top .in{display:flex;gap:8px;align-items:center;padding:12px 14px}
+.brand{font-weight:800}
+.tabs{margin-inline-start:auto;display:flex;gap:10px}
+.tab{border:1px solid var(--border);background:linear-gradient(135deg,var(--r1),var(--r2));color:#fff;padding:10px 18px;border-radius:12px;text-decoration:none;font-size:14px;font-weight:700;box-shadow:0 6px 14px rgba(99,102,241,.35);transition:transform .18s ease, box-shadow .18s ease;display:inline-flex;align-items:center;gap:8px}
+.tab.secondary{background:linear-gradient(135deg,#8b5cf6,#d946ef)}
+.tab:hover{transform:translateY(-1px);box-shadow:0 10px 20px rgba(255,77,109,.45)}
+.frame{height:calc(100vh - 52px)} .frame iframe{width:100%;height:100%;border:0}
+
+.btn:hover{transform:translateY(-1px);box-shadow:0 8px 16px rgba(129,140,248,.45)}
+</style></head><body>
+<div class="top"><div class="in">
+  <div class="brand">Multi-Server SSH Monitor</div>
+  <div class="tabs">
+    <a class="tab" href="/home"><i class="fa-solid fa-house"></i><i class="fa-solid fa-house"></i> خانه</a>
+    <a class="tab secondary" href="/uptime"><i class="fa-solid fa-wave-square"></i><i class="fa-solid fa-wave-square"></i> پایش اختلال</a>
+  </div>
+</div></div>
+<div class="frame"><iframe src="/"></iframe></div>
+</body></html>
+"""
+
+UPTIME_HTML = r"""
+<!doctype html><html lang="fa" dir="rtl"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>پایش اختلال — Multi-Server SSH Monitor</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+:root{--bg:#0f1115;--panel:#141824;--text:#e5e7eb;--muted:#9aa0aa;--ok:#16c47f;--err:#ff5d5d;--border:#262c3e;--r1:#6366f1;--r2:#a855f7;}
+*{box-sizing:border-box} html,body{height:100%}
+body{margin:0;background:linear-gradient(180deg,#0c0f14,#0f1115 25%,#0f1115);color:var(--text);font-family:Inter,system-ui,Segoe UI,Roboto,Arial,sans-serif}
+.top{position:sticky;top:0;z-index:10;backdrop-filter:saturate(160%) blur(8px);background:rgba(16,18,26,.55);border-bottom:1px solid rgba(255,255,255,.06);}
+.top .in{display:flex;gap:8px;align-items:center;padding:12px 14px}
+.brand{font-weight:800}
+.tabs{margin-inline-start:auto;display:flex;gap:10px}
+.tab{border:1px solid var(--border);background:linear-gradient(135deg,var(--r1),var(--r2));color:#fff;padding:10px 18px;border-radius:12px;text-decoration:none;font-size:14px;font-weight:700;box-shadow:0 6px 14px rgba(99,102,241,.35);transition:transform .18s ease, box-shadow .18s ease;display:inline-flex;align-items:center;gap:8px}
+.tab.secondary{background:linear-gradient(135deg,#8b5cf6,#d946ef)}
+.tab:hover{transform:translateY(-1px);box-shadow:0 10px 20px rgba(255,77,109,.45)}
+.container{max-width:1200px;margin:16px auto;padding:0 16px 60px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:14px}
+.card{background:linear-gradient(180deg,#13192a,#121726);border:1px solid #22283a;border-radius:14px;box-shadow:0 6px 18px rgba(0,0,0,.35);padding:12px;overflow:hidden}
+.head{display:flex;align-items:center;gap:8px;margin-bottom:8px}
+.title{font-weight:700}
+.sub{color:var(--muted);font-size:12px}
+.bars2{display:grid;grid-template-columns:repeat(60,1fr);gap:3px;margin-top:6px}
+.bars2 .b{height:10px;border-radius:6px;background:#3a2222}
+.bars2 .b.ok{background:var(--ok)}
+.rowlbl{display:flex;align-items:center;gap:8px;margin-top:4px;color:var(--muted);font-size:12px}
+.kpi{display:flex;gap:14px;margin-top:8px;color:#cfd6e4;font-size:12.5px}
+.kpi b{color:#fff}
+.canvas-wrap{height:120px;margin-top:8px}
+.actions{margin-inline-start:auto;display:flex;gap:6px}
+.btn{border:1px solid var(--border);background:linear-gradient(135deg,#818cf8,#a78bfa);color:#fff;padding:8px 12px;border-radius:10px;font-size:12.5px;cursor:pointer;box-shadow:0 4px 10px rgba(129,140,248,.35);transition:transform .15s ease, box-shadow .15s ease;display:inline-flex;align-items:center;gap:6px}
+.btn:hover{transform:translateY(-1px);box-shadow:0 8px 16px rgba(255,93,115,.45)}
+</style>
+</head><body>
+<div class="top"><div class="in">
+  <div class="brand">Multi-Server SSH Monitor</div>
+  <div class="tabs">
+    <a class="tab" href="/home"><i class="fa-solid fa-house"></i><i class="fa-solid fa-house"></i> خانه</a>
+    <a class="tab secondary" href="/uptime"><i class="fa-solid fa-wave-square"></i><i class="fa-solid fa-wave-square"></i> پایش اختلال</a>
+  </div>
+</div></div>
+
+<div class="container">
+  <div id="grid" class="grid"></div>
+</div>
+
+<script>
+const state = { servers: [], charts:{}, ports:{} };
+
+function makePing(ctx){
+  return new Chart(ctx,{
+    type:'line',
+    data:{labels:[], datasets:[{label:'Ping (ms)', data:[], tension:.35, fill:true}]},
+    options:{ responsive:true, maintainAspectRatio:false, animation:false, plugins:{legend:{display:false}}, scales:{x:{display:false}, y:{display:true}} }
+  });
+}
+
+async function fetchSummary(){
+  try{
+    const sumR = await fetch('/api/summary');
+    const sumJ = await sumR.json();
+    state.servers = Array.isArray(sumJ.servers)? sumJ.servers:[];
+  }catch(e){
+    console.error('uptime summary error', e);
+    state.servers = [];
+  }
+  try{
+    const portsR = await fetch('/api/uptime_settings');
+    if (portsR.ok){
+      state.ports = await portsR.json();
+    } else {
+      state.ports = {};
+    }
+  }catch(e){
+    console.warn('uptime settings error (continuing with defaults)', e);
+    state.ports = {};
+  }
+  renderCards();
+  refreshAll();
+}
+
+function cardHtml(s){
+  const port = state.ports[s.name] || state.ports[s.host] || 80;
+  return `
+    <div class="head">
+      <div class="title">${s.name}</div>
+      <div class="sub" style="margin-inline-start:6px">(${s.host})</div>
+      <div class="actions"><button class="btn" data-setport="${s.name}"><i class="fa-solid fa-gear"></i> <i class="fa-solid fa-gear"></i> تنظیم پورت TCP</button></div>
+    </div>
+    <div class="rowlbl">Ping (60 نقطه اخیر)</div>
+    <div class="bars2" id="bars-ping-${s.name}"></div>
+    <div class="rowlbl">TCP پورت <b id="lblport-${s.name}" style="color:#fff">${port}</b> (60 نقطه اخیر)</div>
+    <div class="bars2" id="bars-tcp-${s.name}"></div>
+    <div class="kpi">
+      <div>آپ‌تایم Ping (۱h): <b id="upP1-${s.name}">—</b></div>
+      <div>آپ‌تایم Ping (۲۴h): <b id="upP24-${s.name}">—</b></div>
+      <div>آپ‌تایم TCP (۱h): <b id="upT1-${s.name}">—</b></div>
+      <div>آپ‌تایم TCP (۲۴h): <b id="upT24-${s.name}">—</b></div>
+      <div>میانگین پینگ (۲۴h): <b id="avgPing-${s.name}">—</b></div>
+      <div>آخرین پینگ: <b id="lastPing-${s.name}">—</b></div>
+    </div>
+    <div class="canvas-wrap"><canvas id="ping-${s.name}"></canvas></div>
+  `;
+}
+
+function renderCards(){
+  const grid = document.getElementById('grid');
+  if (!state.servers || !state.servers.length){
+    if (grid) grid.innerHTML='';
+    const es=document.getElementById('u-empty'); if(es) es.style.display='block';
+    return;
+  } else {
+    const es=document.getElementById('u-empty'); if(es) es.style.display='none';
+  } grid.innerHTML='';
+  for(const s of state.servers){
+    const card = document.createElement('div'); card.className='card'; card.id='card-'+s.name;
+    card.innerHTML = cardHtml(s);
+    grid.appendChild(card);
+    state.charts[s.name] = { ping: makePing(document.getElementById('ping-'+s.name).getContext('2d')) };
+  }
+}
+
+document.addEventListener('click', async (e)=>{
+  const t = e.target.closest('[data-setport]'); if (!t) return;
+  const name = t.getAttribute('data-setport');
+  const curPort = (state.ports[name]?.port || state.ports[name] || 80);
+  const curTo = (state.ports[name]?.timeout_ms || 2000);
+  const curMode = (state.ports[name]?.mode || 'connect');
+  const val = prompt('پورت/تنظیمات برای '+name+' :\nفرمت: port[,timeout_ms][,mode]  (مثال: 443,3000,tls)', `${curPort},${curTo},${curMode}`);
+  if (val===null) return;
+  const parts = val.split(/\s*,\s*/);
+  const port = parseInt(parts[0]||'',10);
+  const timeout_ms = parseInt(parts[1]||'2000',10);
+  const mode = (parts[2]||'connect').toLowerCase();
+  if (!port || port<1 || port>65535) return alert('پورت نامعتبر');
+  const body = {target:name, port, timeout_ms, mode};
+  const r = await fetch('/api/uptime_settings',{method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  if (!r.ok){ alert(await r.text()); return; }
+  state.ports[name]=port;
+  const lbl = document.getElementById('lblport-'+name); if (lbl) lbl.textContent = String(port);
+  await refreshOne(name);
+});
+
+async function refreshOne(name){
+  const r = await fetch('/api/uptime?name='+encodeURIComponent(name)+'&seconds=600');
+  if (!r.ok) return; const j = await r.json();
+  const series = j.series.slice(-60);
+  const pingWrap = document.getElementById('bars-ping-'+name);
+  const tcpWrap  = document.getElementById('bars-tcp-'+name);
+  if (pingWrap){ pingWrap.innerHTML = series.map(p=> `<div class="b${p.ok?' ok':''}"></div>`).join(''); }
+  if (tcpWrap){  tcpWrap.innerHTML  = series.map(p=> `<div class="b${p.tcp?' ok':''}"></div>`).join(''); }
+
+  const s2 = await fetch('/api/uptime_summary?name='+encodeURIComponent(name));
+  if (s2.ok){
+    const x = await s2.json();
+    const set = (id, v, suf)=>{ const el=document.getElementById(id); if (el) el.textContent = (v==null?'—': v.toFixed(2)+(suf||'')); };
+    set('upP1-'+name, x.uptime_ping_1h, '%'); set('upP24-'+name, x.uptime_ping_24h, '%');
+    set('upT1-'+name, x.uptime_tcp_1h, '%');  set('upT24-'+name, x.uptime_tcp_24h, '%');
+    const a = document.getElementById('avgPing-'+name); if (a) a.textContent = (x.ping_avg_24h==null?'—':x.ping_avg_24h.toFixed(1)+' ms');
+    const l = document.getElementById('lastPing-'+name); if (l) l.textContent = (x.last_ms==null?'—':x.last_ms.toFixed(1)+' ms');
+    const lbl = document.getElementById('lblport-'+name); if (lbl) lbl.textContent = x.tcp_port;
+    const l2 = document.getElementById('lblmode-'+name); if (l2) l2.textContent = `mode: ${x.tcp_mode} • timeout: ${x.tcp_timeout_ms}ms`;
+  }
+  const ch = state.charts[name]?.ping;
+  if (ch){
+    const labels = j.series.map(p=> new Date(p.t*1000).toLocaleTimeString('fa-IR',{hour12:false,timeZone:'Asia/Tehran'}));
+    const data = j.series.map(p=> (p.ms==null? null : p.ms));
+    ch.data.labels = labels; ch.data.datasets[0].data = data; ch.update('none');
+  }
+}
+
+async function refreshAll(){
+  for(const s of state.servers){ await refreshOne(s.name); }
+  setTimeout(refreshAll, 5000);
+}
+
+fetchSummary();
+</script>
+</body></html>
+"""
+
+@app.get("/uptime")
+def view_uptime():
+    return render_template_string(UPTIME_HTML)
+
+@app.get("/home")
+def view_home():
+    return Response(NAV_WRAPPER_HTML, mimetype="text/html")
+# ===================== [END APPEND PRO UI] =====================
+
+
+
+# ======================= [APPEND v6] Socket.IO 404 silencer + SSH connect tweak =======================
+from flask import Response as _FlaskResponse
+
+# Stub routes to silence extensions/pages that try to hit /socket.io/*
+@app.get("/socket.io/")
+@app.get("/socket.io/<path:path>")
+def _socketio_stub(path=None):
+    return _FlaskResponse(status=204)
+
+# Gentle tweak: increase Paramiko timeouts to reduce "Error reading SSH protocol banner" on slow/filtered links
+_Original_Connect = Monitor._connect
+def _connect_with_timeouts(self, st):
+    print(f"[DEBUG] Connecting to {st.cfg.name} ({st.cfg.host})...")
+    if st.ssh:
+        try: st.ssh.close()
+        except Exception: pass
+        st.ssh = None
+
+    cli = paramiko.SSHClient()
+    cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        if st.cfg.key_path:
+            pkey = paramiko.RSAKey.from_private_key_file(st.cfg.key_path)
+            cli.connect(
+                hostname=st.cfg.host,
+                port=st.cfg.port,
+                username=st.cfg.username,
+                pkey=pkey,
+                banner_timeout=20,   # was 10
+                auth_timeout=20,     # was 10
+                timeout=20,          # was 10
+            )
+        else:
+            cli.connect(
+                hostname=st.cfg.host,
+                port=st.cfg.port,
+                username=st.cfg.username,
+                password=st.cfg.password,
+                banner_timeout=20,
+                auth_timeout=20,
+                timeout=20,
+            )
+        st.ssh = cli
+        st.connected = True
+        st.last_err = None
+        print(f"[OK] ✅ Connected to {st.cfg.name} ({st.cfg.host})")
+    except Exception as e:
+        st.connected = False
+        st.ssh = None
+        st.last_err = str(e)
+        print(f"[ERR] ❌ Failed to connect {st.cfg.name} ({st.cfg.host}): {e}")
+
+Monitor._connect = _connect_with_timeouts
+# ======================= [END v6] =======================
+
 
 if __name__ == "__main__":
     try:
