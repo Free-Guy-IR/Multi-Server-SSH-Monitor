@@ -772,6 +772,9 @@ DASHBOARD_HTML = r"""
   --shadow:0 6px 18px rgba(0,0,0,.35);
 }
 
+@keyframes blink { 50% { opacity:0; } }
+.warn-icon { position:absolute; top:6px; left:6px; color:var(--err); animation:blink 1s infinite; font-size:18px; }
+
 *{box-sizing:border-box}
 html,body{height:100%}
 body{
@@ -981,6 +984,7 @@ const fmtBytes = (bps) => {
 };
 
 const state = { range: 300, charts: {}, admin: false, token: '', servers: [] };
+const THRESH = {cpu:85, ram:90, disk:90};
 
 // Tehran time (always Asia/Tehran)
 function tickClockTehran(){
@@ -1064,8 +1068,8 @@ function ensureLabels(container){
 function renderCards(servers, interval){
   const grid = document.getElementById('grid');
   for(const s of servers){
-    if (document.getElementById('card-'+s.name)) continue;
-    const card = document.createElement('div'); card.className='card'; card.id='card-'+s.name;
+    if (document.getElementById(`card-${s.name}`)) continue;
+    const card = document.createElement('div'); card.className='card'; card.id=`card-${s.name}`;
     card.innerHTML = `
       <div class="head">
         <div class="title">${s.name} <span class="sub">(${s.host})</span> ${dot(s.connected)}</div>
@@ -1113,6 +1117,12 @@ function updateSummary(servers){
     const v = s.last; const ch = state.charts[s.name]; if (!ch) return;
     const setGauge = (inst, value)=>{ const val = Math.max(0, Math.min(100, value)); inst.data.datasets[0].data=[val,100-val]; inst.update('none'); };
     setGauge(ch.g1, v.cpu); setGauge(ch.g2, v.ram); setGauge(ch.g3, v.disk);
+    const warn = v.cpu>THRESH.cpu || v.ram>THRESH.ram || v.disk>THRESH.disk;
+    const box = document.querySelector(`#card-${s.name}`);
+    const icon = box.querySelector('.warn-icon');
+    if(warn && !icon){ box.insertAdjacentHTML('beforeend','<div class="warn-icon">⚠️</div>'); }
+    if(!warn && icon){ icon.remove(); }
+
     const up = document.getElementById(`up-${s.name}`); const ld = document.getElementById(`ld-${s.name}`);
     if (up) up.textContent = uptimeFmt(v.uptime_s);
     if (ld) ld.textContent = v.load1.toFixed(2);
