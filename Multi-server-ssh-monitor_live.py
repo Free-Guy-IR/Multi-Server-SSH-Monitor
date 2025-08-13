@@ -482,6 +482,22 @@ def index() -> Response:
     return render_template_string(DASHBOARD_HTML, poll_interval=MON.interval)
 
 
+
+@app.get("/api/debug")
+def api_debug():
+    assert MON is not None
+    try:
+        info = {
+            "cwd": os.getcwd(),
+            "cfg_path": getattr(MON, "cfg_path", None),
+            "interval": getattr(MON, "interval", None),
+            "states_count": len(getattr(MON, "states", [])),
+            "names": [s.cfg.name for s in getattr(MON, "states", [])],
+            "admin_token": bool(getattr(MON, "admin_token", None)),
+        }
+    except Exception as e:
+        info = {"error": str(e)}
+    return jsonify(info)
 @app.get("/api/summary")
 def api_summary():
     assert MON is not None
@@ -681,6 +697,8 @@ def api_term_input_all(sid: str):
     data = (request.get_json(silent=True) or {}).get("data", "")
     if not data:
         return jsonify({"error":"empty input"}), 400
+    if isinstance(data, str):
+        data = data.replace("\r\n", "\n").replace("\r", "\n").replace("\\n", "\n")
     for ch in sess["chans"].values():
         try: ch.send(data)
         except Exception: pass
@@ -715,6 +733,51 @@ def api_term_close(sid: str):
     sess["closed"] = True
     return jsonify({"status":"ok"})
 
+
+@app.post("/api/term/interrupt/<sid>")
+def api_term_interrupt(sid: str):
+    assert MON is not None
+    MON._require_token()
+    sess = MON_LIVE["sessions"].get(sid)
+    if not sess:
+        return jsonify({"error":"session not found"}), 404
+    sent = 0
+    # send Ctrl+C twice to all channels (like v9 behavior)
+    for _ in range(2):
+        for ch in list(sess.get("chans", {}).values()):
+            try:
+                ch.send("\x03")
+                sent += 1
+            except Exception:
+                pass
+        time.sleep(0.1)
+    return jsonify({"status":"ok","sent":sent})
+
+
+@app.post("/api/server/update")
+def api_server_update():
+    assert MON is not None
+    data = request.get_json(silent=True) or {}
+    name = data.get("name","")
+    if not name:
+        return jsonify({"error":"missing name"}), 400
+    MON._require_token()
+    st = next((x for x in MON.states if x.cfg.name == name), None)
+    if not st:
+        return jsonify({"error":"server not found"}), 404
+    host = data.get("host"); port = data.get("port"); user = data.get("username")
+    pwd = data.get("password"); key = data.get("key_path")
+    if host is not None: st.cfg.host = host
+    if port is not None: st.cfg.port = int(port)
+    if user is not None: st.cfg.username = user
+    if pwd is not None: st.cfg.password = pwd
+    if key is not None: st.cfg.key_path = key
+    try:
+        MON._connect(st)
+    except Exception:
+        pass
+    MON._save_servers_json()
+    return jsonify({"status":"ok"})
 
 # ---------------- Add/Remove servers routes ----------------
 @app.get("/api/servers")
@@ -754,7 +817,13 @@ DASHBOARD_HTML = r"""
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
 
 <!-- Chart.js -->
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js">
+document.addEventListener('DOMContentLoaded', ()=>{
+  const lp = document.getElementById('lp-toggle');
+  if (lp){ lp.style.display='none'; }
+});
+
+</script>
 
 <style>
 :root{
@@ -771,9 +840,6 @@ DASHBOARD_HTML = r"""
   --card-radius:14px;
   --shadow:0 6px 18px rgba(0,0,0,.35);
 }
-
-@keyframes blink { 50% { opacity:0; } }
-.warn-icon { position:absolute; top:6px; left:6px; color:var(--err); animation:blink 1s infinite; font-size:18px; }
 
 *{box-sizing:border-box}
 html,body{height:100%}
@@ -855,6 +921,13 @@ body{
 .modal .box .actions{margin-top:12px}
 .hidden{display:none}
 .gauge-labels{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:4px;color:#9aa0aa;font-size:12px;text-align:center}
+.mini canvas{display:block;width:100% !important;height:100% !important;}
+
+/* terminal resize styles */
+.g-pane{ resize: both; min-width: 320px; min-height: 200px; overflow: hidden; position: relative; }
+.g-body{ height: 100%; overflow: auto; scrollbar-width: none; } /* Firefox hide */
+.g-body::-webkit-scrollbar{ width:0; height:0; } /* WebKit hide */
+.g-pane .corner-grip{ position:absolute; right:4px; bottom:4px; width:12px; height:12px; border:1px dashed rgba(255,255,255,.25); border-right:none; border-bottom:none; transform: rotate(45deg); pointer-events:none; opacity:.6; }
 </style>
 </head>
 <body>
@@ -863,6 +936,7 @@ body{
     <div class="brand">Multi‑Server SSH Monitor</div>
     <div class="chips">
       <div class="chip" id="now"></div>
+      <button class="btn" id="lp-toggle" title="کاهش مصرف CPU/شبکه">کم‌مصرف: خاموش</button>
       <div class="chip">Tip: use SSH keys</div>
       <div class="chip" id="range-chips">
         بازه: <button class="btn" data-r="60">1m</button>
@@ -925,6 +999,8 @@ body{
       <div class="title" style="font-weight:700">ترمینال کلی (همزمان روی همه سرورها)</div>
       <div class="sub" id="g-sid" style="direction:ltr"></div>
       <div class="actions" style="margin-inline-start:auto">
+        <button class="btn" id="g-stagger" title="کاهش بار رندر خروجی">حالت کم‌مصرف: خاموش</button>
+        <button class="btn danger" id="g-int">توقف همه</button>
         <button class="btn" id="g-close">بستن</button>
       </div>
     </div>
@@ -984,14 +1060,95 @@ const fmtBytes = (bps) => {
 };
 
 const state = { range: 300, charts: {}, admin: false, token: '', servers: [] };
-const THRESH = {cpu:85, ram:90, disk:90};
+
+// ---- Low Power mode + timers ----
+state.lowPower = localStorage.getItem('mssm_lp') === '1';
+state.summaryTimer = null;
+state.seriesTimer = null;
+state.clockTimer = null;
+state._nextIdx = 0;
+
+function setClockTimer(){
+  try{ if (state.clockTimer){ clearInterval(state.clockTimer); } }catch(e){}
+  const period = state.lowPower ? 5000 : 1000;
+  state.clockTimer = setInterval(tickClockTehran, period);
+}
+
+function applyLowPowerUI(){
+  const lpBtn = document.getElementById('lp-toggle');
+  if (lpBtn) lpBtn.textContent = 'کم‌مصرف: ' + (state.lowPower ? 'روشن' : 'خاموش');
+}
+
+function toggleLowPower(){
+  state.lowPower = !state.lowPower;
+  localStorage.setItem('mssm_lp', state.lowPower ? '1' : '0');
+  applyLowPowerUI();
+  setClockTimer();
+  // reschedule fetch & series timers
+  scheduleLoops(state.lastInterval || 3);
+}
+document.getElementById('lp-toggle').addEventListener('click', toggleLowPower);
+
+// ---- Debug FAB (always visible on home) ----
+(function(){
+  function css(el, o){ for(const k in o){ el.style[k]=o[k]; } return el; }
+  function esc(s){ return (s==null)?'':String(s).replace(/[&<>]/g, m=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[m])); }
+  let panel, fab;
+  async function showDebug(){
+    const out = [];
+    try{ const d = await (await fetch('/api/debug')).json();
+         out.push('cfg_path: '+esc(d.cfg_path));
+         out.push('interval: '+esc(d.interval));
+         out.push('states_count: '+esc(d.states_count)+' names: '+JSON.stringify(d.names||[])); }
+    catch(e){ out.push('debug api error: '+e); }
+    try{ const s = await (await fetch('/api/servers')).json();
+         out.push('GET /api/servers -> '+(Array.isArray(s)? s.length : '???')); } catch(e){}
+    try{ const sum = await (await fetch('/api/summary')).json();
+         out.push('summary servers: '+(sum.servers? sum.servers.length : '???')+' interval: '+sum.interval); } catch(e){}
+    if (window.state) out.push('UI state.servers: '+(Array.isArray(state.servers)? state.servers.length : 'n/a'));
+    panel.innerHTML = '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px"><b>Debug</b><button class="btn" id="dbg-close">بستن</button></div>' + '<pre style="white-space:pre-wrap;direction:ltr">'+esc(out.join('\\n'))+'</pre>';
+    panel.style.display='block';
+    const c = document.getElementById('dbg-close'); if (c) c.onclick = ()=> panel.style.display='none';
+  }
+  function ensureUI(){
+    if (!panel){
+      panel = document.createElement('div'); panel.id='dbg-panel';
+      css(panel,{position:'fixed',right:'10px',bottom:'60px',width:'min(60vw,620px)',maxHeight:'60vh',overflow:'auto',background:'#0b0f1a',border:'1px solid #243',boxShadow:'0 6px 24px rgba(0,0,0,.5)',padding:'10px',borderRadius:'10px',zIndex:9999,color:'#cfe2ff',fontSize:'12px',display:'none'});
+      document.body.appendChild(panel);
+    }
+    if (!fab){
+      fab = document.createElement('button'); fab.textContent='🛠'; fab.title='Debug (Alt+D)';
+      fab.className='btn'; css(fab,{position:'fixed',right:'10px',bottom:'10px',zIndex:9999,opacity:0.85});
+      fab.onclick = function(){ panel.innerHTML='<pre>Loading...</pre>'; panel.style.display='block'; showDebug(); };
+      document.body.appendChild(fab);
+      window.addEventListener('keydown', (e)=>{ if (e.altKey && (e.key==='d'||e.key==='D')) fab.click(); });
+    }
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', ensureUI);
+  else ensureUI();
+})();
+
+// ---- Scheduling helpers ----
+function scheduleLoops(interval){
+  state.lastInterval = interval || state.lastInterval || 3;
+  // clear old timers
+  try{ if (state.summaryTimer) clearTimeout(state.summaryTimer); }catch(e){}
+  try{ if (state.seriesTimer) clearInterval(state.seriesTimer); }catch(e){}
+  // schedule summary (status) polling
+  const k = state.lowPower ? 3 : 1;
+  state.summaryTimer = setTimeout(fetchSummary, (state.lastInterval * k) * 1000);
+  // schedule timeseries refresh loop
+  const per = state.lowPower ? 6000 : 2500;
+  state.seriesTimer = setInterval(refreshAllSeries, per);
+}
+
 
 // Tehran time (always Asia/Tehran)
 function tickClockTehran(){
   const fmt = new Intl.DateTimeFormat('fa-IR', {year:'numeric', month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false, timeZone:'Asia/Tehran'});
   document.getElementById('now').textContent = fmt.format(new Date());
 }
-setInterval(tickClockTehran, 1000); tickClockTehran();
+setClockTimer(); tickClockTehran(); applyLowPowerUI();
 
 document.getElementById('range-chips').addEventListener('click', (e)=>{
   const btn = e.target.closest('button[data-r]');
@@ -1006,8 +1163,26 @@ async function fetchSummary(){
   state.admin = !!j.admin_token;
   state.servers = j.servers;
   renderCards(j.servers, j.interval);
+  updateCardStates(j.servers);
+
 }
 
+
+function updateCardStates(list){
+  for(const s of list){
+    const card = document.getElementById('card-'+s.name);
+    if(!card) continue;
+    const d = card.querySelector('.dot');
+    if (d){
+      d.classList.toggle('ok', !!s.connected);
+      d.classList.toggle('bad', !s.connected);
+    }
+    const eb = card.querySelector('.edit-btn');
+    if (eb){
+      eb.style.display = s.connected ? 'none' : 'inline-block';
+    }
+  }
+}
 function makeGauge(ctx, initial){
   return new Chart(ctx, {
     type: 'doughnut',
@@ -1068,13 +1243,14 @@ function ensureLabels(container){
 function renderCards(servers, interval){
   const grid = document.getElementById('grid');
   for(const s of servers){
-    if (document.getElementById(`card-${s.name}`)) continue;
-    const card = document.createElement('div'); card.className='card'; card.id=`card-${s.name}`;
+    if (document.getElementById('card-'+s.name)) continue;
+    const card = document.createElement('div'); card.className='card'; card.id='card-'+s.name;
     card.innerHTML = `
       <div class="head">
         <div class="title">${s.name} <span class="sub">(${s.host})</span> ${dot(s.connected)}</div>
         <div class="actions">
           <button class="btn" onclick="openModal('${s.name}','${s.host}')">مدیریت</button>
+          <button class="btn edit-btn" style="display:none" onclick="openOfflineEditor('${s.name}')">ویرایش</button>
           <button class="btn" onclick="showTop('${s.name}')">Top</button>
         </div>
       </div>
@@ -1106,7 +1282,7 @@ function renderCards(servers, interval){
   }
   updateSummary(servers);
   refreshAllSeries();
-  setTimeout(fetchSummary, interval*1000);
+  scheduleLoops(interval);
 }
 
 function updateSummary(servers){
@@ -1117,12 +1293,6 @@ function updateSummary(servers){
     const v = s.last; const ch = state.charts[s.name]; if (!ch) return;
     const setGauge = (inst, value)=>{ const val = Math.max(0, Math.min(100, value)); inst.data.datasets[0].data=[val,100-val]; inst.update('none'); };
     setGauge(ch.g1, v.cpu); setGauge(ch.g2, v.ram); setGauge(ch.g3, v.disk);
-    const warn = v.cpu>THRESH.cpu || v.ram>THRESH.ram || v.disk>THRESH.disk;
-    const box = document.querySelector(`#card-${s.name}`);
-    const icon = box.querySelector('.warn-icon');
-    if(warn && !icon){ box.insertAdjacentHTML('beforeend','<div class="warn-icon">⚠️</div>'); }
-    if(!warn && icon){ icon.remove(); }
-
     const up = document.getElementById(`up-${s.name}`); const ld = document.getElementById(`ld-${s.name}`);
     if (up) up.textContent = uptimeFmt(v.uptime_s);
     if (ld) ld.textContent = v.load1.toFixed(2);
@@ -1130,8 +1300,13 @@ function updateSummary(servers){
 }
 
 async function refreshAllSeries(){
-  for(const s of state.servers){
-    await refreshSeriesFor(s.name);
+  if (!state.servers || state.servers.length===0) return;
+  if (!state.lowPower){
+    for(const s of state.servers){ await refreshSeriesFor(s.name); }
+  }else{
+    const i = state._nextIdx % state.servers.length;
+    const target = state.servers[i]; state._nextIdx++;
+    if (target) await refreshSeriesFor(target.name);
   }
 }
 
@@ -1149,6 +1324,25 @@ async function refreshSeriesFor(name){
 }
 
 let currentServer = null;
+
+function openServerEditor(name){
+  try{
+    const m = document.getElementById('msmodal');
+    if (!m){ alert('Server editor not found'); return; }
+    const item = (state.servers||[]).find(x=>x.name===name) || null;
+    m.style.display = 'flex';
+    const F = (id, val)=>{ const el=document.getElementById(id); if(el) el.value = (val!=null? String(val): ''); };
+    F('ms-name', item? item.name : name || '');
+    F('ms-host', item? (item.host||'') : '');
+    F('ms-port', item? (item.port||22) : 22);
+    F('ms-user', item? (item.username||'root') : 'root');
+    F('ms-pass', item? (item.password||'') : '');
+    F('ms-key',  item? (item.key_path||'') : '');
+    // focus first empty field
+    const firstEmpty = ['ms-host','ms-user','ms-pass','ms-key'].map(id=>document.getElementById(id)).find(el=>el && !el.value);
+    (firstEmpty || document.getElementById('ms-host')).focus();
+  }catch(e){ console.error(e); }
+}
 function openModal(name, host){
   currentServer = name;
   document.getElementById('modal-title').textContent = `مدیریت ${name}`;
@@ -1238,8 +1432,18 @@ let gSid = null, gES = null, gServers = [];
 document.getElementById('btn-global-term').addEventListener('click', ()=>{ document.getElementById('gmodal').style.display='flex'; });
 document.getElementById('g-close').addEventListener('click', ()=>{ if (gES){ try{ gES.close(); }catch(e){} gES=null; } gSid=null; document.getElementById('gmodal').style.display='none'; });
 document.getElementById('g-start').addEventListener('click', startGlobal);
+
+document.getElementById('btn-global-term').addEventListener('click', ()=>{
+  const t = document.getElementById('g-stagger');
+  if (t){ t.textContent = state.lowPower ? 'کم‌مصرف: روشن' : 'کم‌مصرف: خاموش'; }
+});
+
 document.getElementById('g-sendall').addEventListener('click', sendAll);
 document.getElementById('g-stop').addEventListener('click', stopGlobal);
+document.getElementById('g-int').addEventListener('click', async ()=>{
+  if(!gSid){ alert('سشن فعال نیست'); return; }
+  try{ await doPOST('/api/term/interrupt/'+encodeURIComponent(gSid)); }catch(e){ alert('خطا: '+e.message); }
+});
 document.getElementById('g-input').addEventListener('keydown', (e)=>{ if (e.key==='Enter'){ e.preventDefault(); sendAll(); } });
 
 function addPane(name){
@@ -1257,8 +1461,62 @@ function addPane(name){
   document.getElementById('g-outputs').appendChild(box);
 }
 function appendPane(name, txt){ const el = document.getElementById('go-'+name); if (!el) return; el.textContent += txt; el.scrollTop = el.scrollHeight; }
+// --- Global Terminal Low-Power wrapper ---
+const _appendPaneNow = appendPane;
+let GT_STAGGER_ON = false;
+const paneQueues = new Map();
+const paneOrder = [];
+let flushIdx = 0;
+let FLUSH_MS = 80;
+let flushTimer = null;
+
+function ensureFlushTimer(){
+  if (flushTimer) return;
+  flushTimer = setInterval(()=>{
+    if (!GT_STAGGER_ON) return;
+    if (paneOrder.length === 0) return;
+    const name = paneOrder[flushIdx % paneOrder.length];
+    flushIdx++;
+    const q = paneQueues.get(name);
+    if (!q || q.length === 0) return;
+    const chunk = q.splice(0, q.length).join('');
+    _appendPaneNow(name, chunk);
+  }, FLUSH_MS);
+}
+
+appendPane = function(name, txt){
+  if (!GT_STAGGER_ON) { _appendPaneNow(name, txt); return; }
+  if (!paneQueues.has(name)) paneQueues.set(name, []);
+  paneQueues.get(name).push(txt);
+  if (!paneOrder.includes(name)) paneOrder.push(name);
+  ensureFlushTimer();
+};
+
+// toggle button (terminal modal controls GLOBAL low-power)
+document.addEventListener('click', (ev)=>{
+  const t = ev.target;
+  if (t && t.id === 'g-stagger'){
+    try{
+      state.lowPower = !state.lowPower;
+      localStorage.setItem('mssm_lp', state.lowPower ? '1' : '0');
+      // When low-power is ON, also stagger terminal output to lighten the UI.
+      if (typeof GT_STAGGER_ON !== 'undefined') window.GT_STAGGER_ON = state.lowPower;
+      t.textContent = state.lowPower ? 'کم‌مصرف: روشن' : 'کم‌مصرف: خاموش';
+      if (typeof scheduleLoops === 'function') scheduleLoops(state.lastInterval || 3);
+      if (typeof applyLowPowerUI === 'function') applyLowPowerUI();
+    }catch(e){}
+  }
+});
+
 document.body.addEventListener('click', (e)=>{ const t=e.target; if (t.dataset && t.dataset.sendOne){ sendOne(t.dataset.sendOne); } });
 
+
+async function sendAllRaw(payload){
+  if (!gSid) { alert('سشن فعال نیست'); return; }
+  const headers = {'Content-Type':'application/json'};
+  if (state.token) headers['X-Auth-Token'] = state.token;
+  await fetch('/api/term/input_all/'+encodeURIComponent(gSid), {method:'POST', headers, body: JSON.stringify({data: payload})});
+}
 async function startGlobal(){
   if (gSid){ alert('سشن فعال است'); return; }
   const cmd = document.getElementById('g-cmd').value.trim();
@@ -1283,14 +1541,28 @@ async function sendAll(){
   document.getElementById('g-input').value='';
   const headers = {'Content-Type':'application/json'};
   if (state.token) headers['X-Auth-Token'] = state.token;
-  await fetch('/api/term/input_all/'+encodeURIComponent(gSid), {method:'POST', headers, body: JSON.stringify({data: val+"\\n"})});
+  await fetch('/api/term/input_all/'+encodeURIComponent(gSid), {method:'POST', headers, body: JSON.stringify({data: val+"\n"})});
 }
 async function sendOne(name){
   if (!gSid) return;
   const val = prompt('ورودی فقط برای '+name+':',''); if (val===null) return;
   const headers = {'Content-Type':'application/json'};
   if (state.token) headers['X-Auth-Token'] = state.token;
-  await fetch('/api/term/input_one/'+encodeURIComponent(gSid)+'/'+encodeURIComponent(name), {method:'POST', headers, body: JSON.stringify({data: val+"\\n"})});
+  await fetch('/api/term/input_one/'+encodeURIComponent(gSid)+'/'+encodeURIComponent(name), {method:'POST', headers, body: JSON.stringify({data: val+"\n"})});
+}
+
+async function forceStopAll(){
+  if (!gSid){ return; }
+  try{ await sendAllRaw('\u0003'); }catch(e){}
+  const sid = gSid;
+  // آزادسازی فوری UI
+  gSid = null;
+  if (gES){ try{ gES.close(); }catch(e){} gES = null; }
+  const sidEl = document.getElementById('g-sid'); if (sidEl) sidEl.textContent = 'SID: —';
+  // fire-and-forget close on server
+  const headers = {'Content-Type':'application/json'};
+  if (state.token) headers['X-Auth-Token'] = state.token;
+  try{ fetch('/api/term/close/'+encodeURIComponent(sid), {method:'POST', headers}); }catch(e){}
 }
 async function stopGlobal(){
   if (!gSid) return;
@@ -1345,7 +1617,7 @@ async function addServer(){
 
 async function showTop(name){
   const r = await fetch(`/api/top/${encodeURIComponent(name)}`);
-  if (!r.ok) return;
+  if (!r.ok){ alert('Top fetch failed'); return; }
   const j = await r.json();
   let txt = 'Top 5 by CPU:\nPID\tCPU%\tMEM%\tCMD\n';
   for(const row of j.rows){
@@ -1366,6 +1638,251 @@ async function showTop(name){
   renderCards(sumJ.servers, sumJ.interval);
 })();
 </script>
+
+<script>
+(function(){
+  function ensureHelpers(){
+    window.state = window.state || {lowPower:false};
+    if (typeof applyLowPowerUI !== 'function'){
+      window.applyLowPowerUI = function(){
+        var b = document.getElementById('lp-toggle');
+        if (b) b.textContent = 'کم‌مصرف: ' + (state.lowPower ? 'روشن' : 'خاموش');
+      }
+    }
+    if (typeof setClockTimer !== 'function'){
+      window.setClockTimer = function(){
+        try{ if (state.clockTimer){ clearInterval(state.clockTimer); } }catch(e){}
+        var period = state.lowPower ? 5000 : 1000;
+        state.clockTimer = setInterval(window.tickClockTehran || function(){}, period);
+      }
+    }
+    if (typeof scheduleLoops !== 'function'){
+      window.scheduleLoops = function(interval){
+        state.lastInterval = interval || state.lastInterval || 3;
+        try{ if (state.summaryTimer) clearTimeout(state.summaryTimer); }catch(e){}
+        try{ if (state.seriesTimer) clearInterval(state.seriesTimer); }catch(e){}
+        var k = state.lowPower ? 3 : 1;
+        state.summaryTimer = setTimeout(window.fetchSummary || function(){}, (state.lastInterval * k) * 1000);
+        var per = state.lowPower ? 6000 : 2500;
+        state.seriesTimer = setInterval(window.refreshAllSeries || function(){}, per);
+      }
+    }
+    if (typeof toggleLowPower !== 'function'){
+      window.toggleLowPower = function(){
+        state.lowPower = !state.lowPower;
+        try{ localStorage.setItem('mssm_lp', state.lowPower ? '1' : '0'); }catch(e){}
+        applyLowPowerUI(); setClockTimer(); scheduleLoops(state.lastInterval || 3);
+      }
+    }
+  }
+
+  function ensureButton(){
+    var btn = document.getElementById('lp-toggle');
+    if (!btn){
+      btn = document.createElement('button');
+      btn.id = 'lp-toggle';
+      btn.className = 'btn';
+      btn.title = 'کاهش مصرف CPU/شبکه';
+      btn.style.marginInlineStart = '6px';
+      btn.textContent = 'کم‌مصرف: ' + (window.state && state.lowPower ? 'روشن' : 'خاموش');
+      var host = document.querySelector('.chips') || document.querySelector('header') || document.body;
+      host.appendChild(btn);
+    }
+    if (!btn.dataset.bound){
+      btn.addEventListener('click', function(){ try{ toggleLowPower(); }catch(e){} });
+      btn.dataset.bound = '1';
+    }
+  }
+
+  function boot(){
+    ensureHelpers();
+    ensureButton();
+    if (window.applyLowPowerUI) applyLowPowerUI();
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
+})();
+</script>
+
+
+<script>
+(function(){
+  function bootLP(){
+    try{
+      var btn = document.getElementById('lp-toggle');
+      if(!btn) return;
+      if(!btn.dataset.bound){
+        btn.addEventListener('click', toggleLowPower);
+        btn.dataset.bound = '1';
+      }
+      if (typeof applyLowPowerUI === 'function') applyLowPowerUI();
+      if (typeof setClockTimer  === 'function') setClockTimer();
+    }catch(e){ console.error('[LP bind]', e); }
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', bootLP);
+  else bootLP();
+})();
+</script>
+
+
+<script>
+/* LP binder */
+(function(){
+  function bootLP(){
+    try{
+      var btn = document.getElementById('lp-toggle');
+      if(!btn) return;
+      if(!btn.dataset.bound){
+        btn.addEventListener('click', toggleLowPower);
+        btn.dataset.bound = '1';
+      }
+      if (typeof applyLowPowerUI === 'function') applyLowPowerUI();
+      if (typeof setClockTimer  === 'function') setClockTimer();
+    }catch(e){ console.error('[LP bind]', e); }
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', bootLP);
+  else bootLP();
+})();
+</script>
+
+
+<!-- Edit Server Modal (lightweight) -->
+<div id="editmodal" class="modal" role="dialog" aria-modal="true" style="display:none">
+  <div class="box" style="width:min(520px,92vw)">
+    <div class="head" style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+      <div class="title" style="font-weight:700">ویرایش اتصال سرور</div>
+      <div class="sub" id="edit-sub"></div>
+      <div class="actions" style="margin-inline-start:auto">
+        <button class="btn" id="edit-close">بستن</button>
+      </div>
+    </div>
+    <div class="row">
+      <div><label>IP/Host</label><input id="edit-host" placeholder="1.2.3.4"></div>
+      <div><label>Port</label><input id="edit-port" value="22"></div>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <div><label>Username</label><input id="edit-user" value="root"></div>
+      <div><label>Password</label><input id="edit-pass" placeholder="(اختیاری اگر کلید دارید)"></div>
+      <div><label>Key path</label><input id="edit-key" placeholder="~/.ssh/id_rsa (اختیاری)"></div>
+    </div>
+    <div class="actions" style="gap:8px">
+      <button class="btn" id="edit-save">ذخیره</button>
+    </div>
+  </div>
+</div>
+
+
+<script>
+let editTargetName = null;
+function openOfflineEditor(name){
+  editTargetName = name;
+  const m = document.getElementById('editmodal');
+  const item = (state.servers||[]).find(x=>x.name===name) || null;
+  document.getElementById('edit-sub').textContent = '('+name+')';
+  const get = (id)=>document.getElementById(id);
+  get('edit-host').value = item? (item.host||'') : '';
+  get('edit-port').value = item? (item.port||22) : 22;
+  get('edit-user').value = item? (item.username||'root') : 'root';
+  get('edit-pass').value = item? (item.password||'') : '';
+  get('edit-key').value  = item? (item.key_path||'') : '';
+  m.style.display='flex';
+}
+document.getElementById('edit-close').addEventListener('click', ()=>{ document.getElementById('editmodal').style.display='none'; });
+document.getElementById('edit-save').addEventListener('click', async ()=>{
+  if (!editTargetName) return;
+  const headers = {'Content-Type':'application/json'}; if (state.token) headers['X-Auth-Token']=state.token;
+  const body = {
+    name: editTargetName,
+    host: document.getElementById('edit-host').value.trim(),
+    port: parseInt(document.getElementById('edit-port').value.trim()||'22', 10),
+    username: document.getElementById('edit-user').value.trim(),
+  };
+  const pwd = document.getElementById('edit-pass').value;
+  const key = document.getElementById('edit-key').value.trim();
+  if (pwd !== '') body.password = pwd; else body.password = null;
+  body.key_path = key || null;
+  const r = await fetch('/api/server/update', {method:'POST', headers, body: JSON.stringify(body)});
+  if (!r.ok){ alert(await r.text()); return; }
+  document.getElementById('editmodal').style.display='none';
+  try{ alert('ذخیره شد. در حال تلاش برای اتصال مجدد...'); }catch(e){}
+  setTimeout(fetchSummary, 300);
+});
+</script>
+
+
+<script>
+// --- Terminal pane sizing persistence & init ---
+(function(){
+  function loadTermSizes(){
+    try{ return JSON.parse(localStorage.getItem('mssm_term_sizes')||'{}'); }catch(e){ return {}; }
+  }
+  function saveTermSizes(map){
+    try{ localStorage.setItem('mssm_term_sizes', JSON.stringify(map)); }catch(e){}
+  }
+  const termSizes = loadTermSizes();
+
+  const _appendPane = appendPane;
+  appendPane = function(name, txt){
+    const existed = !!document.getElementById('g-out-'+name);
+    _appendPane(name, txt);
+    if (!existed){
+      try{
+        const pane = document.getElementById('g-out-'+name)?.closest('.g-pane') || null;
+        if (pane){
+          if (!pane.querySelector('.corner-grip')){
+            const grip = document.createElement('div'); grip.className='corner-grip'; pane.appendChild(grip);
+          }
+          let sz = termSizes[name];
+          if (!sz){
+            const card = document.getElementById('card-'+name);
+            if (card){
+              const r = card.getBoundingClientRect();
+              sz = {w: Math.max( Math.round(r.width), 360 ), h: Math.max( Math.round(r.height), 240 )};
+            }else{
+              sz = {w: 480, h: 300};
+            }
+          }
+          pane.style.width  = (sz.w) + 'px';
+          pane.style.height = (sz.h) + 'px';
+
+          if (!pane._ro){
+            let t=null;
+            pane._ro = new ResizeObserver(()=>{
+              if (t) clearTimeout(t);
+              t = setTimeout(()=>{
+                try{
+                  const w = Math.round(pane.getBoundingClientRect().width);
+                  const h = Math.round(pane.getBoundingClientRect().height);
+                  termSizes[name] = {w,h};
+                  saveTermSizes(termSizes);
+                }catch(e){}
+              }, 220);
+            });
+            pane._ro.observe(pane);
+          }
+        }
+      }catch(e){ console.error('term pane init size', e); }
+    }
+  };
+
+  function applySavedSizes(){
+    try{
+      const sizes = loadTermSizes();
+      for(const k in sizes){
+        const pane = document.getElementById('g-out-'+k)?.closest('.g-pane');
+        if (pane){
+          pane.style.width = sizes[k].w + 'px';
+          pane.style.height = sizes[k].h + 'px';
+        }
+      }
+    }catch(e){}
+  }
+  document.addEventListener('DOMContentLoaded', ()=>{
+    setTimeout(applySavedSizes, 500);
+  });
+})();
+</script>
+
 </body>
 </html>
 """
@@ -1879,6 +2396,13 @@ body{margin:0;background:linear-gradient(180deg,#0c0f14,#0f1115 25%,#0f1115);col
 .frame{height:calc(100vh - 52px)} .frame iframe{width:100%;height:100%;border:0}
 
 .btn:hover{transform:translateY(-1px);box-shadow:0 8px 16px rgba(129,140,248,.45)}
+.mini canvas{display:block;width:100% !important;height:100% !important;}
+
+/* terminal resize styles */
+.g-pane{ resize: both; min-width: 320px; min-height: 200px; overflow: hidden; position: relative; }
+.g-body{ height: 100%; overflow: auto; scrollbar-width: none; } /* Firefox hide */
+.g-body::-webkit-scrollbar{ width:0; height:0; } /* WebKit hide */
+.g-pane .corner-grip{ position:absolute; right:4px; bottom:4px; width:12px; height:12px; border:1px dashed rgba(255,255,255,.25); border-right:none; border-bottom:none; transform: rotate(45deg); pointer-events:none; opacity:.6; }
 </style></head><body>
 <div class="top"><div class="in">
   <div class="brand">Multi-Server SSH Monitor</div>
@@ -1888,6 +2412,251 @@ body{margin:0;background:linear-gradient(180deg,#0c0f14,#0f1115 25%,#0f1115);col
   </div>
 </div></div>
 <div class="frame"><iframe src="/"></iframe></div>
+
+<script>
+(function(){
+  function ensureHelpers(){
+    window.state = window.state || {lowPower:false};
+    if (typeof applyLowPowerUI !== 'function'){
+      window.applyLowPowerUI = function(){
+        var b = document.getElementById('lp-toggle');
+        if (b) b.textContent = 'کم‌مصرف: ' + (state.lowPower ? 'روشن' : 'خاموش');
+      }
+    }
+    if (typeof setClockTimer !== 'function'){
+      window.setClockTimer = function(){
+        try{ if (state.clockTimer){ clearInterval(state.clockTimer); } }catch(e){}
+        var period = state.lowPower ? 5000 : 1000;
+        state.clockTimer = setInterval(window.tickClockTehran || function(){}, period);
+      }
+    }
+    if (typeof scheduleLoops !== 'function'){
+      window.scheduleLoops = function(interval){
+        state.lastInterval = interval || state.lastInterval || 3;
+        try{ if (state.summaryTimer) clearTimeout(state.summaryTimer); }catch(e){}
+        try{ if (state.seriesTimer) clearInterval(state.seriesTimer); }catch(e){}
+        var k = state.lowPower ? 3 : 1;
+        state.summaryTimer = setTimeout(window.fetchSummary || function(){}, (state.lastInterval * k) * 1000);
+        var per = state.lowPower ? 6000 : 2500;
+        state.seriesTimer = setInterval(window.refreshAllSeries || function(){}, per);
+      }
+    }
+    if (typeof toggleLowPower !== 'function'){
+      window.toggleLowPower = function(){
+        state.lowPower = !state.lowPower;
+        try{ localStorage.setItem('mssm_lp', state.lowPower ? '1' : '0'); }catch(e){}
+        applyLowPowerUI(); setClockTimer(); scheduleLoops(state.lastInterval || 3);
+      }
+    }
+  }
+
+  function ensureButton(){
+    var btn = document.getElementById('lp-toggle');
+    if (!btn){
+      btn = document.createElement('button');
+      btn.id = 'lp-toggle';
+      btn.className = 'btn';
+      btn.title = 'کاهش مصرف CPU/شبکه';
+      btn.style.marginInlineStart = '6px';
+      btn.textContent = 'کم‌مصرف: ' + (window.state && state.lowPower ? 'روشن' : 'خاموش');
+      var host = document.querySelector('.chips') || document.querySelector('header') || document.body;
+      host.appendChild(btn);
+    }
+    if (!btn.dataset.bound){
+      btn.addEventListener('click', function(){ try{ toggleLowPower(); }catch(e){} });
+      btn.dataset.bound = '1';
+    }
+  }
+
+  function boot(){
+    ensureHelpers();
+    ensureButton();
+    if (window.applyLowPowerUI) applyLowPowerUI();
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
+})();
+</script>
+
+
+<script>
+(function(){
+  function bootLP(){
+    try{
+      var btn = document.getElementById('lp-toggle');
+      if(!btn) return;
+      if(!btn.dataset.bound){
+        btn.addEventListener('click', toggleLowPower);
+        btn.dataset.bound = '1';
+      }
+      if (typeof applyLowPowerUI === 'function') applyLowPowerUI();
+      if (typeof setClockTimer  === 'function') setClockTimer();
+    }catch(e){ console.error('[LP bind]', e); }
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', bootLP);
+  else bootLP();
+})();
+</script>
+
+
+<script>
+/* LP binder */
+(function(){
+  function bootLP(){
+    try{
+      var btn = document.getElementById('lp-toggle');
+      if(!btn) return;
+      if(!btn.dataset.bound){
+        btn.addEventListener('click', toggleLowPower);
+        btn.dataset.bound = '1';
+      }
+      if (typeof applyLowPowerUI === 'function') applyLowPowerUI();
+      if (typeof setClockTimer  === 'function') setClockTimer();
+    }catch(e){ console.error('[LP bind]', e); }
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', bootLP);
+  else bootLP();
+})();
+</script>
+
+
+<!-- Edit Server Modal (lightweight) -->
+<div id="editmodal" class="modal" role="dialog" aria-modal="true" style="display:none">
+  <div class="box" style="width:min(520px,92vw)">
+    <div class="head" style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+      <div class="title" style="font-weight:700">ویرایش اتصال سرور</div>
+      <div class="sub" id="edit-sub"></div>
+      <div class="actions" style="margin-inline-start:auto">
+        <button class="btn" id="edit-close">بستن</button>
+      </div>
+    </div>
+    <div class="row">
+      <div><label>IP/Host</label><input id="edit-host" placeholder="1.2.3.4"></div>
+      <div><label>Port</label><input id="edit-port" value="22"></div>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <div><label>Username</label><input id="edit-user" value="root"></div>
+      <div><label>Password</label><input id="edit-pass" placeholder="(اختیاری اگر کلید دارید)"></div>
+      <div><label>Key path</label><input id="edit-key" placeholder="~/.ssh/id_rsa (اختیاری)"></div>
+    </div>
+    <div class="actions" style="gap:8px">
+      <button class="btn" id="edit-save">ذخیره</button>
+    </div>
+  </div>
+</div>
+
+
+<script>
+let editTargetName = null;
+function openOfflineEditor(name){
+  editTargetName = name;
+  const m = document.getElementById('editmodal');
+  const item = (state.servers||[]).find(x=>x.name===name) || null;
+  document.getElementById('edit-sub').textContent = '('+name+')';
+  const get = (id)=>document.getElementById(id);
+  get('edit-host').value = item? (item.host||'') : '';
+  get('edit-port').value = item? (item.port||22) : 22;
+  get('edit-user').value = item? (item.username||'root') : 'root';
+  get('edit-pass').value = item? (item.password||'') : '';
+  get('edit-key').value  = item? (item.key_path||'') : '';
+  m.style.display='flex';
+}
+document.getElementById('edit-close').addEventListener('click', ()=>{ document.getElementById('editmodal').style.display='none'; });
+document.getElementById('edit-save').addEventListener('click', async ()=>{
+  if (!editTargetName) return;
+  const headers = {'Content-Type':'application/json'}; if (state.token) headers['X-Auth-Token']=state.token;
+  const body = {
+    name: editTargetName,
+    host: document.getElementById('edit-host').value.trim(),
+    port: parseInt(document.getElementById('edit-port').value.trim()||'22', 10),
+    username: document.getElementById('edit-user').value.trim(),
+  };
+  const pwd = document.getElementById('edit-pass').value;
+  const key = document.getElementById('edit-key').value.trim();
+  if (pwd !== '') body.password = pwd; else body.password = null;
+  body.key_path = key || null;
+  const r = await fetch('/api/server/update', {method:'POST', headers, body: JSON.stringify(body)});
+  if (!r.ok){ alert(await r.text()); return; }
+  document.getElementById('editmodal').style.display='none';
+  try{ alert('ذخیره شد. در حال تلاش برای اتصال مجدد...'); }catch(e){}
+  setTimeout(fetchSummary, 300);
+});
+</script>
+
+
+<script>
+// --- Terminal pane sizing persistence & init ---
+(function(){
+  function loadTermSizes(){
+    try{ return JSON.parse(localStorage.getItem('mssm_term_sizes')||'{}'); }catch(e){ return {}; }
+  }
+  function saveTermSizes(map){
+    try{ localStorage.setItem('mssm_term_sizes', JSON.stringify(map)); }catch(e){}
+  }
+  const termSizes = loadTermSizes();
+
+  const _appendPane = appendPane;
+  appendPane = function(name, txt){
+    const existed = !!document.getElementById('g-out-'+name);
+    _appendPane(name, txt);
+    if (!existed){
+      try{
+        const pane = document.getElementById('g-out-'+name)?.closest('.g-pane') || null;
+        if (pane){
+          if (!pane.querySelector('.corner-grip')){
+            const grip = document.createElement('div'); grip.className='corner-grip'; pane.appendChild(grip);
+          }
+          let sz = termSizes[name];
+          if (!sz){
+            const card = document.getElementById('card-'+name);
+            if (card){
+              const r = card.getBoundingClientRect();
+              sz = {w: Math.max( Math.round(r.width), 360 ), h: Math.max( Math.round(r.height), 240 )};
+            }else{
+              sz = {w: 480, h: 300};
+            }
+          }
+          pane.style.width  = (sz.w) + 'px';
+          pane.style.height = (sz.h) + 'px';
+
+          if (!pane._ro){
+            let t=null;
+            pane._ro = new ResizeObserver(()=>{
+              if (t) clearTimeout(t);
+              t = setTimeout(()=>{
+                try{
+                  const w = Math.round(pane.getBoundingClientRect().width);
+                  const h = Math.round(pane.getBoundingClientRect().height);
+                  termSizes[name] = {w,h};
+                  saveTermSizes(termSizes);
+                }catch(e){}
+              }, 220);
+            });
+            pane._ro.observe(pane);
+          }
+        }
+      }catch(e){ console.error('term pane init size', e); }
+    }
+  };
+
+  function applySavedSizes(){
+    try{
+      const sizes = loadTermSizes();
+      for(const k in sizes){
+        const pane = document.getElementById('g-out-'+k)?.closest('.g-pane');
+        if (pane){
+          pane.style.width = sizes[k].w + 'px';
+          pane.style.height = sizes[k].h + 'px';
+        }
+      }
+    }catch(e){}
+  }
+  document.addEventListener('DOMContentLoaded', ()=>{
+    setTimeout(applySavedSizes, 500);
+  });
+})();
+</script>
+
 </body></html>
 """
 
@@ -1927,6 +2696,13 @@ body{margin:0;background:linear-gradient(180deg,#0c0f14,#0f1115 25%,#0f1115);col
 .actions{margin-inline-start:auto;display:flex;gap:6px}
 .btn{border:1px solid var(--border);background:linear-gradient(135deg,#818cf8,#a78bfa);color:#fff;padding:8px 12px;border-radius:10px;font-size:12.5px;cursor:pointer;box-shadow:0 4px 10px rgba(129,140,248,.35);transition:transform .15s ease, box-shadow .15s ease;display:inline-flex;align-items:center;gap:6px}
 .btn:hover{transform:translateY(-1px);box-shadow:0 8px 16px rgba(255,93,115,.45)}
+.mini canvas{display:block;width:100% !important;height:100% !important;}
+
+/* terminal resize styles */
+.g-pane{ resize: both; min-width: 320px; min-height: 200px; overflow: hidden; position: relative; }
+.g-body{ height: 100%; overflow: auto; scrollbar-width: none; } /* Firefox hide */
+.g-body::-webkit-scrollbar{ width:0; height:0; } /* WebKit hide */
+.g-pane .corner-grip{ position:absolute; right:4px; bottom:4px; width:12px; height:12px; border:1px dashed rgba(255,255,255,.25); border-right:none; border-bottom:none; transform: rotate(45deg); pointer-events:none; opacity:.6; }
 </style>
 </head><body>
 <div class="top"><div class="in">
@@ -2049,6 +2825,251 @@ async function refreshAll(){
 
 fetchSummary();
 </script>
+
+<script>
+(function(){
+  function ensureHelpers(){
+    window.state = window.state || {lowPower:false};
+    if (typeof applyLowPowerUI !== 'function'){
+      window.applyLowPowerUI = function(){
+        var b = document.getElementById('lp-toggle');
+        if (b) b.textContent = 'کم‌مصرف: ' + (state.lowPower ? 'روشن' : 'خاموش');
+      }
+    }
+    if (typeof setClockTimer !== 'function'){
+      window.setClockTimer = function(){
+        try{ if (state.clockTimer){ clearInterval(state.clockTimer); } }catch(e){}
+        var period = state.lowPower ? 5000 : 1000;
+        state.clockTimer = setInterval(window.tickClockTehran || function(){}, period);
+      }
+    }
+    if (typeof scheduleLoops !== 'function'){
+      window.scheduleLoops = function(interval){
+        state.lastInterval = interval || state.lastInterval || 3;
+        try{ if (state.summaryTimer) clearTimeout(state.summaryTimer); }catch(e){}
+        try{ if (state.seriesTimer) clearInterval(state.seriesTimer); }catch(e){}
+        var k = state.lowPower ? 3 : 1;
+        state.summaryTimer = setTimeout(window.fetchSummary || function(){}, (state.lastInterval * k) * 1000);
+        var per = state.lowPower ? 6000 : 2500;
+        state.seriesTimer = setInterval(window.refreshAllSeries || function(){}, per);
+      }
+    }
+    if (typeof toggleLowPower !== 'function'){
+      window.toggleLowPower = function(){
+        state.lowPower = !state.lowPower;
+        try{ localStorage.setItem('mssm_lp', state.lowPower ? '1' : '0'); }catch(e){}
+        applyLowPowerUI(); setClockTimer(); scheduleLoops(state.lastInterval || 3);
+      }
+    }
+  }
+
+  function ensureButton(){
+    var btn = document.getElementById('lp-toggle');
+    if (!btn){
+      btn = document.createElement('button');
+      btn.id = 'lp-toggle';
+      btn.className = 'btn';
+      btn.title = 'کاهش مصرف CPU/شبکه';
+      btn.style.marginInlineStart = '6px';
+      btn.textContent = 'کم‌مصرف: ' + (window.state && state.lowPower ? 'روشن' : 'خاموش');
+      var host = document.querySelector('.chips') || document.querySelector('header') || document.body;
+      host.appendChild(btn);
+    }
+    if (!btn.dataset.bound){
+      btn.addEventListener('click', function(){ try{ toggleLowPower(); }catch(e){} });
+      btn.dataset.bound = '1';
+    }
+  }
+
+  function boot(){
+    ensureHelpers();
+    ensureButton();
+    if (window.applyLowPowerUI) applyLowPowerUI();
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
+})();
+</script>
+
+
+<script>
+(function(){
+  function bootLP(){
+    try{
+      var btn = document.getElementById('lp-toggle');
+      if(!btn) return;
+      if(!btn.dataset.bound){
+        btn.addEventListener('click', toggleLowPower);
+        btn.dataset.bound = '1';
+      }
+      if (typeof applyLowPowerUI === 'function') applyLowPowerUI();
+      if (typeof setClockTimer  === 'function') setClockTimer();
+    }catch(e){ console.error('[LP bind]', e); }
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', bootLP);
+  else bootLP();
+})();
+</script>
+
+
+<script>
+/* LP binder */
+(function(){
+  function bootLP(){
+    try{
+      var btn = document.getElementById('lp-toggle');
+      if(!btn) return;
+      if(!btn.dataset.bound){
+        btn.addEventListener('click', toggleLowPower);
+        btn.dataset.bound = '1';
+      }
+      if (typeof applyLowPowerUI === 'function') applyLowPowerUI();
+      if (typeof setClockTimer  === 'function') setClockTimer();
+    }catch(e){ console.error('[LP bind]', e); }
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', bootLP);
+  else bootLP();
+})();
+</script>
+
+
+<!-- Edit Server Modal (lightweight) -->
+<div id="editmodal" class="modal" role="dialog" aria-modal="true" style="display:none">
+  <div class="box" style="width:min(520px,92vw)">
+    <div class="head" style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+      <div class="title" style="font-weight:700">ویرایش اتصال سرور</div>
+      <div class="sub" id="edit-sub"></div>
+      <div class="actions" style="margin-inline-start:auto">
+        <button class="btn" id="edit-close">بستن</button>
+      </div>
+    </div>
+    <div class="row">
+      <div><label>IP/Host</label><input id="edit-host" placeholder="1.2.3.4"></div>
+      <div><label>Port</label><input id="edit-port" value="22"></div>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <div><label>Username</label><input id="edit-user" value="root"></div>
+      <div><label>Password</label><input id="edit-pass" placeholder="(اختیاری اگر کلید دارید)"></div>
+      <div><label>Key path</label><input id="edit-key" placeholder="~/.ssh/id_rsa (اختیاری)"></div>
+    </div>
+    <div class="actions" style="gap:8px">
+      <button class="btn" id="edit-save">ذخیره</button>
+    </div>
+  </div>
+</div>
+
+
+<script>
+let editTargetName = null;
+function openOfflineEditor(name){
+  editTargetName = name;
+  const m = document.getElementById('editmodal');
+  const item = (state.servers||[]).find(x=>x.name===name) || null;
+  document.getElementById('edit-sub').textContent = '('+name+')';
+  const get = (id)=>document.getElementById(id);
+  get('edit-host').value = item? (item.host||'') : '';
+  get('edit-port').value = item? (item.port||22) : 22;
+  get('edit-user').value = item? (item.username||'root') : 'root';
+  get('edit-pass').value = item? (item.password||'') : '';
+  get('edit-key').value  = item? (item.key_path||'') : '';
+  m.style.display='flex';
+}
+document.getElementById('edit-close').addEventListener('click', ()=>{ document.getElementById('editmodal').style.display='none'; });
+document.getElementById('edit-save').addEventListener('click', async ()=>{
+  if (!editTargetName) return;
+  const headers = {'Content-Type':'application/json'}; if (state.token) headers['X-Auth-Token']=state.token;
+  const body = {
+    name: editTargetName,
+    host: document.getElementById('edit-host').value.trim(),
+    port: parseInt(document.getElementById('edit-port').value.trim()||'22', 10),
+    username: document.getElementById('edit-user').value.trim(),
+  };
+  const pwd = document.getElementById('edit-pass').value;
+  const key = document.getElementById('edit-key').value.trim();
+  if (pwd !== '') body.password = pwd; else body.password = null;
+  body.key_path = key || null;
+  const r = await fetch('/api/server/update', {method:'POST', headers, body: JSON.stringify(body)});
+  if (!r.ok){ alert(await r.text()); return; }
+  document.getElementById('editmodal').style.display='none';
+  try{ alert('ذخیره شد. در حال تلاش برای اتصال مجدد...'); }catch(e){}
+  setTimeout(fetchSummary, 300);
+});
+</script>
+
+
+<script>
+// --- Terminal pane sizing persistence & init ---
+(function(){
+  function loadTermSizes(){
+    try{ return JSON.parse(localStorage.getItem('mssm_term_sizes')||'{}'); }catch(e){ return {}; }
+  }
+  function saveTermSizes(map){
+    try{ localStorage.setItem('mssm_term_sizes', JSON.stringify(map)); }catch(e){}
+  }
+  const termSizes = loadTermSizes();
+
+  const _appendPane = appendPane;
+  appendPane = function(name, txt){
+    const existed = !!document.getElementById('g-out-'+name);
+    _appendPane(name, txt);
+    if (!existed){
+      try{
+        const pane = document.getElementById('g-out-'+name)?.closest('.g-pane') || null;
+        if (pane){
+          if (!pane.querySelector('.corner-grip')){
+            const grip = document.createElement('div'); grip.className='corner-grip'; pane.appendChild(grip);
+          }
+          let sz = termSizes[name];
+          if (!sz){
+            const card = document.getElementById('card-'+name);
+            if (card){
+              const r = card.getBoundingClientRect();
+              sz = {w: Math.max( Math.round(r.width), 360 ), h: Math.max( Math.round(r.height), 240 )};
+            }else{
+              sz = {w: 480, h: 300};
+            }
+          }
+          pane.style.width  = (sz.w) + 'px';
+          pane.style.height = (sz.h) + 'px';
+
+          if (!pane._ro){
+            let t=null;
+            pane._ro = new ResizeObserver(()=>{
+              if (t) clearTimeout(t);
+              t = setTimeout(()=>{
+                try{
+                  const w = Math.round(pane.getBoundingClientRect().width);
+                  const h = Math.round(pane.getBoundingClientRect().height);
+                  termSizes[name] = {w,h};
+                  saveTermSizes(termSizes);
+                }catch(e){}
+              }, 220);
+            });
+            pane._ro.observe(pane);
+          }
+        }
+      }catch(e){ console.error('term pane init size', e); }
+    }
+  };
+
+  function applySavedSizes(){
+    try{
+      const sizes = loadTermSizes();
+      for(const k in sizes){
+        const pane = document.getElementById('g-out-'+k)?.closest('.g-pane');
+        if (pane){
+          pane.style.width = sizes[k].w + 'px';
+          pane.style.height = sizes[k].h + 'px';
+        }
+      }
+    }catch(e){}
+  }
+  document.addEventListener('DOMContentLoaded', ()=>{
+    setTimeout(applySavedSizes, 500);
+  });
+})();
+</script>
+
 </body></html>
 """
 
